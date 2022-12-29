@@ -28,6 +28,7 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/specularl2/specular/clients/geth/specular/proof/proof"
 	"github.com/specularl2/specular/clients/geth/specular/proof/prover"
+	"github.com/specularl2/specular/clients/geth/specular/proof/state"
 )
 
 const (
@@ -42,38 +43,56 @@ type ProverConfig struct {
 }
 
 type ExecutionState struct {
-	VMHash         common.Hash
-	L2GasUsed      *big.Int
-	Block          *types.Block
-	TransactionIdx uint64
-	StepIdx        uint64
+	VMHash            common.Hash
+	CumulativeGasUsed *big.Int
+	BlockGasUsed      *big.Int
+	StateType         state.StateType
+	Block             *types.Block
+	TransactionIdx    uint64
+	StepIdx           uint64
 }
 
 func (s *ExecutionState) MarshalJson() ([]byte, error) {
 	return json.Marshal(&struct {
-		VMHash         common.Hash `json:"vmHash"`
-		L2GasUsed      *big.Int    `json:"l2GasUsed"`
-		BlockHash      common.Hash `json:"blockHash"`
-		TransactionIdx uint64      `json:"txnIdx"`
-		StepIdx        uint64      `json:"stepIdx"`
+		VMHash            common.Hash `json:"vmHash"`
+		CumulativeGasUsed *big.Int    `json:"cumulativeGasUsed"`
+		BlockGasUsed      *big.Int    `json:"blockGasUsed"`
+		StateType         string      `json:"stateType"`
+		BlockHash         common.Hash `json:"blockHash"`
+		TransactionIdx    uint64      `json:"txnIdx"`
+		StepIdx           uint64      `json:"stepIdx"`
 	}{
-		VMHash:         s.VMHash,
-		L2GasUsed:      s.L2GasUsed,
-		BlockHash:      s.Block.Hash(),
-		TransactionIdx: s.TransactionIdx,
-		StepIdx:        s.StepIdx,
+		VMHash:            s.VMHash,
+		CumulativeGasUsed: s.CumulativeGasUsed,
+		BlockGasUsed:      s.BlockGasUsed,
+		StateType:         string(s.StateType),
+		BlockHash:         s.Block.Hash(),
+		TransactionIdx:    s.TransactionIdx,
+		StepIdx:           s.StepIdx,
 	})
 }
 
 func (s *ExecutionState) Hash() common.Hash {
+	gasUsed := new(big.Int).Add(s.CumulativeGasUsed, s.BlockGasUsed)
 	gas := make([]byte, 32)
-	s.L2GasUsed.FillBytes(gas)
+	gasUsed.FillBytes(gas)
 	return crypto.Keccak256Hash(gas[:], s.VMHash.Bytes())
 }
 
-// This function generates execution states across blocks [startNum, endNum)
-// For example there are 2 transactions: a, b
-// The states are: inter-state before a, intra-states in a, inter-state before b (after a), intra-states in b, inter-state after b
+// [GenerateStates] generates execution states across blocks [startNum, endNum)
+//
+// For example there are 2 blocks: block A with transactions A1, A2; block B without transactions.
+//
+// The states are (in order):
+//  1. the BlockState of the block right before A
+//  2. the InterState before A1
+//  3. the IntraStates of A1 if A1 is not an EOA transfer
+//  4. the InterState before A2 (after A1)
+//  5. the IntraStates of A2 if A2 is not an EOA transfer
+//  6. the InterState after A2
+//  7. the BlockState of the block A
+//  8. a dummy InterState
+//  9. the BlockState of the block B
 func GenerateStates(backend Backend, ctx context.Context, startGasUsed *big.Int, startNum, endNum uint64, config *ProverConfig) ([]*ExecutionState, error) {
 	parent, err := backend.BlockByNumber(ctx, rpc.BlockNumber(startNum-1))
 	if err != nil {
@@ -83,6 +102,7 @@ func GenerateStates(backend Backend, ctx context.Context, startGasUsed *big.Int,
 	if config != nil && config.Reexec != nil {
 		reexec = *config.Reexec
 	}
+	// The statedb here is the state at the end of the parent blcok
 	statedb, err := backend.StateAtBlock(ctx, parent, reexec, nil, true, false)
 	if err != nil {
 		return nil, err
@@ -91,8 +111,32 @@ func GenerateStates(backend Backend, ctx context.Context, startGasUsed *big.Int,
 		states []*ExecutionState
 		block  *types.Block
 	)
+	chainCtx := createChainContext(backend, ctx)
 	cumulativeGasUsed := new(big.Int).Set(startGasUsed)
+
+	// Push the block state of the parent block
+	parentBlockCtx := core.NewEVMBlockContext(parent.Header(), chainCtx, nil)
+	cumulativeGasUsedCopy := new(big.Int).Set(cumulativeGasUsed)
+	blockHashTree, err := state.BlockHashTreeFromBlockContext(&parentBlockCtx)
+	if err != nil {
+		return nil, err
+	}
+	bs, err := state.BlockStateFromBlock(parentBlockCtx.BlockNumber.Uint64(), statedb, cumulativeGasUsedCopy, blockHashTree)
+	if err != nil {
+		return nil, err
+	}
+	states = append(states, &ExecutionState{
+		VMHash:            bs.Hash(),
+		CumulativeGasUsed: cumulativeGasUsedCopy,
+		BlockGasUsed:      common.Big0,
+		StateType:         state.BlockStateType,
+		Block:             parent,
+		TransactionIdx:    0,
+		StepIdx:           0,
+	})
+
 	for num := startNum; num < endNum; num++ {
+		// Preparation of block context
 		block, err = backend.BlockByNumber(ctx, rpc.BlockNumber(num))
 		if err != nil {
 			return nil, err
@@ -101,24 +145,48 @@ func GenerateStates(backend Backend, ctx context.Context, startGasUsed *big.Int,
 			return nil, fmt.Errorf("block #%d not found", num)
 		}
 		signer := types.MakeSigner(backend.ChainConfig(), block.Number())
-		blockCtx := core.NewEVMBlockContext(block.Header(), createChainContext(backend, ctx), nil)
+		blockCtx := core.NewEVMBlockContext(block.Header(), chainCtx, nil)
+		blockHashTree, err := state.BlockHashTreeFromBlockContext(&blockCtx)
+		if err != nil {
+			return nil, err
+		}
+		transactions := block.Transactions()
+		receipts, _ := backend.GetReceipts(ctx, block.Hash())
+		cumulativeGasUsedBeforeBlock := new(big.Int).Set(cumulativeGasUsed)
+
 		// Trace all the transactions contained within
-		for i, tx := range block.Transactions() {
-			// Push inter-state hash
-			states = append(states, &ExecutionState{
-				VMHash:         statedb.IntermediateRoot(backend.ChainConfig().IsEIP158(block.Number())),
-				L2GasUsed:      new(big.Int).Set(cumulativeGasUsed),
-				Block:          block,
-				TransactionIdx: uint64(i),
-				StepIdx:        0,
-			})
+		for i, tx := range transactions {
+			// Prepare the transaction context
 			msg, _ := tx.AsMessage(signer, block.BaseFee())
 			txContext := core.NewEVMTxContext(msg)
-			prover := prover.NewStateGenerator()
-			// Run the transaction with tracing enabled.
-			vmenv := vm.NewEVM(blockCtx, txContext, statedb, backend.ChainConfig(), vm.Config{Debug: true, Tracer: prover, NoBaseFee: true})
 			// Call Prepare to clear out the statedb access list
 			statedb.Prepare(tx.Hash(), i)
+
+			// Push the inter state before transaction i
+			blockGasUsed := new(big.Int).Sub(cumulativeGasUsed, cumulativeGasUsedBeforeBlock)
+			its := state.InterStateFromCaptured(
+				block.NumberU64(),
+				uint64(i),
+				statedb,
+				cumulativeGasUsedBeforeBlock,
+				blockGasUsed,
+				transactions,
+				receipts,
+				blockHashTree,
+			)
+			states = append(states, &ExecutionState{
+				VMHash:            its.Hash(),
+				CumulativeGasUsed: cumulativeGasUsedBeforeBlock,
+				BlockGasUsed:      blockGasUsed,
+				StateType:         state.InterStateType,
+				Block:             block,
+				TransactionIdx:    uint64(i),
+				StepIdx:           0,
+			})
+
+			// Execute transaction i with intra state generator enabled.
+			prover := prover.NewIntraStateGenerator(block.NumberU64(), uint64(i), statedb, *its, blockHashTree)
+			vmenv := vm.NewEVM(blockCtx, txContext, statedb, backend.ChainConfig(), vm.Config{Debug: true, Tracer: prover})
 			executionResult, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.Gas()))
 			if err != nil {
 				return nil, fmt.Errorf("tracing failed: %w", err)
@@ -129,55 +197,178 @@ func GenerateStates(backend Backend, ctx context.Context, startGasUsed *big.Int,
 			}
 			for idx, s := range generatedStates {
 				states = append(states, &ExecutionState{
-					VMHash:         s.VMHash,
-					L2GasUsed:      new(big.Int).Add(cumulativeGasUsed, new(big.Int).SetUint64(tx.Gas()-s.Gas)),
-					Block:          block,
-					TransactionIdx: uint64(i),
-					StepIdx:        uint64(idx + 1),
+					VMHash:            s.VMHash,
+					CumulativeGasUsed: cumulativeGasUsedBeforeBlock,
+					BlockGasUsed:      new(big.Int).Add(blockGasUsed, new(big.Int).SetUint64(tx.Gas()-s.Gas)),
+					StateType:         state.IntraStateType,
+					Block:             block,
+					TransactionIdx:    uint64(i),
+					StepIdx:           uint64(idx + 1),
 				})
 			}
 			// Include refund
 			cumulativeGasUsed.Add(cumulativeGasUsed, new(big.Int).SetUint64(executionResult.UsedGas))
 		}
-		// Get next statedb if we are not at the last block
-		if num < endNum-1 {
-			statedb, err = backend.StateAtBlock(ctx, block, reexec, statedb, true, false)
-			if err != nil {
-				return nil, err
-			}
+
+		// Push the inter state after all transactions
+		blockGasUsed := new(big.Int).Sub(cumulativeGasUsed, cumulativeGasUsedBeforeBlock)
+		its := state.InterStateFromCaptured(
+			block.NumberU64(),
+			uint64(len(transactions)),
+			statedb,
+			cumulativeGasUsedBeforeBlock,
+			blockGasUsed,
+			transactions,
+			receipts,
+			blockHashTree,
+		)
+		states = append(states, &ExecutionState{
+			VMHash:            its.Hash(),
+			CumulativeGasUsed: cumulativeGasUsedBeforeBlock,
+			BlockGasUsed:      blockGasUsed,
+			StateType:         state.InterStateType,
+			Block:             block,
+			TransactionIdx:    uint64(len(block.Transactions())),
+			StepIdx:           0,
+		})
+
+		// Get next statedb to skip simulating block finalization
+		// Here the statedb is the state at the end of the current block
+		// (i.e. start of the new block)
+		statedb, err = backend.StateAtBlock(ctx, block, reexec, statedb, true, false)
+		if err != nil {
+			return nil, err
 		}
+
+		// Push the block state of the current finalized block
+		cumulativeGasUsedCopy = new(big.Int).Set(cumulativeGasUsed)
+		bs, err := state.BlockStateFromBlock(block.NumberU64(), statedb, cumulativeGasUsedCopy, blockHashTree)
+		if err != nil {
+			return nil, err
+		}
+		states = append(states, &ExecutionState{
+			VMHash:            bs.Hash(),
+			CumulativeGasUsed: cumulativeGasUsedCopy,
+			BlockGasUsed:      common.Big0,
+			StateType:         state.BlockStateType,
+			Block:             block,
+			TransactionIdx:    0,
+			StepIdx:           0,
+		})
 	}
-	states = append(states, &ExecutionState{
-		VMHash:         block.Root(),
-		L2GasUsed:      cumulativeGasUsed,
-		Block:          block,
-		TransactionIdx: uint64(len(block.Transactions())),
-		StepIdx:        0,
-	})
 	return states, nil
 }
 
+// [GenerateProof] serves as an entrypoint for one-step proof generation.
+// There are 6 types of one-step proofs:
+//  1. BlockState -> InterState: block initiation
+//  2. InterState -> IntraState: transaction initiation (contract call or creation)
+//  3. InterState -> InterState: EOA transfer transaction
+//  4. IntraState -> IntraState: one-step EVM execution (require tracing)
+//  5. IntraState -> InterState: transaction finalization (require tracing)
+//  6. InterState -> BlockState: block finalization
 func GenerateProof(backend Backend, ctx context.Context, startState *ExecutionState, config *ProverConfig) (*proof.OneStepProof, error) {
 	if startState.Block == nil {
 		return nil, fmt.Errorf("bad start state")
 	}
-	if startState.TransactionIdx >= uint64(len(startState.Block.Transactions())) {
+	transactions := startState.Block.Transactions()
+	if startState.TransactionIdx > uint64(len(transactions)) {
 		return nil, fmt.Errorf("bad start state")
 	}
+
 	reexec := defaultProveReexec
 	if config != nil && config.Reexec != nil {
 		reexec = *config.Reexec
 	}
+
+	// Type 1: block initiation or Type 6: block finalization
+	if startState.StateType == state.BlockStateType || (startState.StateType == state.InterStateType && startState.TransactionIdx == uint64(len(transactions))) {
+		statedb, err := backend.StateAtBlock(ctx, startState.Block, reexec, nil, true, false)
+		if err != nil {
+			return nil, err
+		}
+		chainCtx := createChainContext(backend, ctx)
+		vmctx := core.NewEVMBlockContext(startState.Block.Header(), chainCtx, nil)
+		blockHashTree, err := state.BlockHashTreeFromBlockContext(&vmctx)
+		if err != nil {
+			return nil, err
+		}
+		if startState.StateType == state.BlockStateType {
+			// Type 1: block initiation
+			bs, err := state.BlockStateFromBlock(startState.Block.NumberU64(), statedb, startState.CumulativeGasUsed, blockHashTree)
+			if err != nil {
+				return nil, err
+			}
+			return proof.GetBlockInitiationProof(bs)
+		} else {
+			// Type 6: block finalization
+			receipts, _ := backend.GetReceipts(ctx, startState.Block.Hash())
+			its := state.InterStateFromCaptured(
+				startState.Block.NumberU64(),
+				startState.TransactionIdx,
+				statedb,
+				startState.CumulativeGasUsed,
+				startState.BlockGasUsed,
+				transactions,
+				receipts,
+				blockHashTree,
+			)
+			return proof.GetBlockFinalizationProof(its)
+		}
+	}
+
+	// Prepare block and transaction context
 	msg, vmctx, statedb, err := backend.StateAtTransaction(ctx, startState.Block, int(startState.TransactionIdx), reexec)
 	if err != nil {
 		return nil, err
 	}
 	txContext := core.NewEVMTxContext(msg)
-	prover := prover.NewProver(startState.VMHash, startState.StepIdx)
-	// Run the transaction with tracing enabled.
-	vmenv := vm.NewEVM(vmctx, txContext, statedb, backend.ChainConfig(), vm.Config{Debug: true, Tracer: prover, NoBaseFee: true})
+	receipts, err := backend.GetReceipts(ctx, startState.Block.Hash())
+	if err != nil {
+		return nil, err
+	}
+	blockHashTree, err := state.BlockHashTreeFromBlockContext(&vmctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Prepare the inter state before transaction for the prover
+	its := state.InterStateFromCaptured(
+		startState.Block.NumberU64(),
+		startState.TransactionIdx,
+		statedb,
+		startState.CumulativeGasUsed,
+		startState.BlockGasUsed,
+		transactions,
+		receipts,
+		blockHashTree,
+	)
+
+	transaction := transactions[startState.TransactionIdx]
+
+	if startState.StateType == state.InterStateType {
+		// Type 2: transaction initiation or Type 3: EOA transfer transaction
+		return proof.GetTransactionInitaitionProof(backend.ChainConfig(), &vmctx, transaction, &txContext, its, statedb)
+	}
+	// Type 4: one-step EVM execution or Type 5: transaction finalization. Both require tracing.
+
+	// Set up the prover
+	prover := prover.NewProver(
+		startState.VMHash,
+		startState.StepIdx,
+		backend.ChainConfig().Rules(vmctx.BlockNumber, vmctx.Random != nil),
+		startState.Block.NumberU64(),
+		startState.TransactionIdx,
+		statedb,
+		*its,
+		blockHashTree,
+		transaction,
+		receipts[startState.TransactionIdx],
+	)
+	// Run the transaction with prover enabled.
+	vmenv := vm.NewEVM(vmctx, txContext, statedb, backend.ChainConfig(), vm.Config{Debug: true, Tracer: prover})
 	// Call Prepare to clear out the statedb access list
-	txHash := startState.Block.Transactions()[startState.TransactionIdx].Hash()
+	txHash := transactions[startState.TransactionIdx].Hash()
 	statedb.Prepare(txHash, int(startState.TransactionIdx))
 	_, err = core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.Gas()))
 	if err != nil {

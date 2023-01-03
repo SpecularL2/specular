@@ -35,7 +35,7 @@ interface IRollup {
 
     event AssertionRejected(uint256 assertionID);
 
-    event StakerStaked(address stakerAddr, uint256 assertionID);
+    event StakerStaked(address indexed stakerAddr, uint256 assertionID);
 
     /// @dev Thrown when address that have not staked any token calls a only-staked function
     error NotStaked();
@@ -117,10 +117,16 @@ interface IRollup {
     function assertions() external view returns (AssertionMap);
 
     /**
-     * @param addr User address.
-     * @return True if address is staked, else False.
+     * @notice Gets the ID of the assertion staker is currently staked on.
+     * @param stakerAddress Address of staker.
      */
-    function isStaked(address addr) external view returns (bool);
+    function getAssertionID(address stakerAddress) external view returns (uint256);
+
+    /**
+     * @notice Gets the challenge the staker is currently engaged in.
+     * @param stakerAddress Address of staker.
+     */
+    function getCurrentChallenge(address stakerAddress) external view returns (address);
 
     /**
      * @return The current required stake amount.

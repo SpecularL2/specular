@@ -27,8 +27,10 @@ import "./ISequencerInbox.sol";
 import "./libraries/DeserializationLib.sol";
 import "./libraries/Errors.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 
-contract SequencerInbox is ISequencerInbox, Initializable {
+contract SequencerInbox is ISequencerInbox, Initializable, UUPSUpgradeable, OwnableUpgradeable {
     string private constant EMPTY_BATCH = "EMPTY_BATCH";
 
     // Total number of transactions
@@ -43,12 +45,16 @@ contract SequencerInbox is ISequencerInbox, Initializable {
             revert ZeroAddress();
         }
         sequencerAddress = _sequencerAddress;
+        __Ownable_init();
+        __UUPSUpgradeable_init();
     }
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
+
+    function _authorizeUpgrade(address) internal override onlyOwner {}
 
     function getInboxSize() external view override returns (uint256) {
         return inboxSize;

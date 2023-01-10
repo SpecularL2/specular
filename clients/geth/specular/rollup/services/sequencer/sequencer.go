@@ -15,13 +15,14 @@ import (
 	"github.com/specularl2/specular/clients/geth/specular/bindings"
 	"github.com/specularl2/specular/clients/geth/specular/proof"
 	"github.com/specularl2/specular/clients/geth/specular/rollup/services"
+	rollup_mock "github.com/specularl2/specular/clients/geth/specular/rollup/services/mock"
 	rollupTypes "github.com/specularl2/specular/clients/geth/specular/rollup/types"
 )
 
 const timeInterval = 10 * time.Second
 
 func RegisterService(stack *node.Node, eth services.Backend, proofBackend proof.Backend, cfg *services.Config, auth *bind.TransactOpts) {
-	sequencer, err := New(eth, proofBackend, cfg, auth)
+	sequencer, err := NewSequencer(eth, proofBackend, cfg, auth)
 	if err != nil {
 		log.Crit("Failed to register the Rollup service", "err", err)
 	}
@@ -46,7 +47,18 @@ type Sequencer struct {
 	challengeResoutionCh chan struct{}
 }
 
-func New(eth services.Backend, proofBackend proof.Backend, cfg *services.Config, auth *bind.TransactOpts) (*Sequencer, error) {
+// Current Sequencer assumes no Berlin+London fork on L2
+type MockSequencer struct {
+	*services.MockBaseService
+
+	batchCh              chan *rollupTypes.TxBatch
+	pendingAssertionCh   chan *rollupTypes.Assertion
+	confirmedIDCh        chan *big.Int
+	challengeCh          chan *challengeCtx
+	challengeResoutionCh chan struct{}
+}
+
+func NewSequencer(eth services.Backend, proofBackend proof.Backend, cfg *services.Config, auth *bind.TransactOpts) (*Sequencer, error) {
 	base, err := services.NewBaseService(eth, proofBackend, cfg, auth)
 	if err != nil {
 		return nil, err
@@ -54,6 +66,22 @@ func New(eth services.Backend, proofBackend proof.Backend, cfg *services.Config,
 	s := &Sequencer{
 		BaseService:          base,
 		blockCh:              make(chan types.Blocks, 4096),
+		pendingAssertionCh:   make(chan *rollupTypes.Assertion, 4096),
+		confirmedIDCh:        make(chan *big.Int, 4096),
+		challengeCh:          make(chan *challengeCtx),
+		challengeResoutionCh: make(chan struct{}),
+	}
+	return s, nil
+}
+
+func NewMockSequencer(eth *rollup_mock.MockBackend, proofBackend proof.Backend, cfg *services.Config, auth *bind.TransactOpts) (*MockSequencer, error) {
+	base, err := services.NewMockBaseService(eth, proofBackend, cfg, auth)
+	if err != nil {
+		return nil, err
+	}
+	s := &MockSequencer{
+		MockBaseService:      base,
+		batchCh:              make(chan *rollupTypes.TxBatch, 4096),
 		pendingAssertionCh:   make(chan *rollupTypes.Assertion, 4096),
 		confirmedIDCh:        make(chan *big.Int, 4096),
 		challengeCh:          make(chan *challengeCtx),
@@ -546,9 +574,10 @@ func (s *Sequencer) Start() error {
 }
 
 func (s *Sequencer) Stop() error {
-	log.Info("Sequencer stopped")
+	log.Info("Stopping sequencer...")
 	s.Cancel()
 	s.Wg.Wait()
+	log.Info("Sequencer stopped.")
 	return nil
 }
 

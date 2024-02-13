@@ -22,7 +22,37 @@
 
 pragma solidity ^0.8.0;
 
-interface IRollup {
+interface RollupData {
+    struct AssertionState {
+        mapping(address => bool) stakers; // all stakers that have ever staked on this assertion.
+        mapping(bytes32 => bool) childStateCommitments; // child state commitments
+    }
+
+    struct Zombie {
+        address stakerAddress;
+        uint256 lastAssertionID;
+    }
+
+    struct InitialRollupState {
+        uint256 assertionID;
+        uint256 l2BlockNum;
+        bytes32 l2BlockHash;
+        bytes32 l2StateRoot;
+    }
+
+    struct Config {
+        address vault;
+        address daProvider;
+        address verifier;
+        uint256 confirmationPeriod;
+        uint256 challengePeriod;
+        uint256 minimumAssertionPeriod;
+        uint256 baseStakeAmount;
+        address[] validators;
+    }
+}
+
+interface IRollup is RollupData {
     event ConfigChanged();
 
     event AssertionCreated(uint256 assertionID, address asserterAddr, bytes32 vmHash);
@@ -188,6 +218,24 @@ interface IRollup {
     // *** Configuration ***
 
     /**
+     * @notice Sets a ne configuration, generally run at initialization time.
+     *
+     * Emits: `ConfigChanged` event.
+     *
+     * @param _config A new Config
+     */
+    function setConfig(Config calldata _config) external;
+
+    /**
+     * @notice Sets a new vault address
+     *
+     * Emits: `ConfigChanged` event.
+     *
+     * @param newVault New vault address
+     */
+    function setVault(address newVault) external;
+
+    /**
      * @notice Sets a new DA provider
      *
      * Emits: `ConfigChanged` event.
@@ -195,6 +243,15 @@ interface IRollup {
      * @param newDAProvider New DA provider
      */
     function setDAProvider(address newDAProvider) external;
+
+    /**
+     * @notice Sets a new Verifier
+     *
+     * Emits: `ConfigChanged` event.
+     *
+     * @param newVerifier New Verifier
+     */
+    function setVerifier(address newVerifier) external;
 
     /**
      * @notice Sets a new confirmation period

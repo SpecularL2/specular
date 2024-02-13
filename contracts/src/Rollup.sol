@@ -37,39 +37,8 @@ import "./libraries/Errors.sol";
 import "./IDAProvider.sol";
 import "./IRollup.sol";
 
-abstract contract RollupData {
-    struct AssertionState {
-        mapping(address => bool) stakers; // all stakers that have ever staked on this assertion.
-        mapping(bytes32 => bool) childStateCommitments; // child state commitments
-    }
-
-    struct Zombie {
-        address stakerAddress;
-        uint256 lastAssertionID;
-    }
-
-    struct Config {
-        address vault;
-        address daProvider;
-        address verifier;
-        uint256 confirmationPeriod;
-        uint256 challengePeriod;
-        uint256 minimumAssertionPeriod;
-        uint256 baseStakeAmount;
-        address[] validators;
-    }
-
-    struct InitialRollupState {
-        uint256 assertionID;
-        uint256 l2BlockNum;
-        bytes32 l2BlockHash;
-        bytes32 l2StateRoot;
-    }
-}
-
 abstract contract RollupBase is
     IRollup,
-    RollupData,
     IChallengeResultReceiver,
     Initializable,
     UUPSUpgradeable,
@@ -122,25 +91,14 @@ contract Rollup is RollupBase {
     mapping(address => uint256) public withdrawableFunds; // mapping from addresses to withdrawable funds (won in challenge)
     Zombie[] public zombies; // stores stakers that lost a challenge
 
-    function initialize(Config calldata _config) public initializer {
-        if (_config.vault == address(0) || _config.daProvider == address(0) || _config.verifier == address(0)) {
-            revert ZeroAddress();
-        }
+    function initialize() public initializer {
         __RollupBase_init();
-
-        vault = _config.vault;
-        daProvider = IDAProvider(_config.daProvider);
-        verifier = IVerifier(_config.verifier);
-
-        confirmationPeriod = _config.confirmationPeriod;
-        challengePeriod = _config.challengePeriod;
-        minimumAssertionPeriod = _config.minimumAssertionPeriod;
-        baseStakeAmount = _config.baseStakeAmount;
-
-        // Initialize role based access control
-        for (uint256 i = 0; i < _config.validators.length; i++) {
-            grantRole(VALIDATOR_ROLE, _config.validators[i]);
-        }
+        // set values to 0, makes sure unpause checks work correctly
+        verifier = IVerifier(address(0));
+        daProvider = IDAProvider(address(0));
+        vault = address(0);
+        // initialize in a paused state to prevent core interactions until necessary values are set
+        pause();
     }
 
     function initializeGenesis(InitialRollupState calldata _initialRollupState) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -175,6 +133,10 @@ contract Rollup is RollupBase {
     }
 
     function unpause() public onlyRole(DEFAULT_ADMIN_ROLE) {
+        // verify we have values set to allow contract to unpause
+        if (verifier == IVerifier(address(0)) || daProvider == IDAProvider(address(0)) || vault == address(0)) {
+            revert ZeroAddress();
+        }
         _unpause();
     }
 
@@ -286,11 +248,51 @@ contract Rollup is RollupBase {
     }
 
     /// @inheritdoc IRollup
+    function setConfig(Config calldata _config) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_config.vault == address(0) || _config.daProvider == address(0) || _config.verifier == address(0)) {
+            revert ZeroAddress();
+        }
+
+        vault = _config.vault;
+        daProvider = IDAProvider(_config.daProvider);
+        verifier = IVerifier(_config.verifier);
+
+        confirmationPeriod = _config.confirmationPeriod;
+        challengePeriod = _config.challengePeriod;
+        minimumAssertionPeriod = _config.minimumAssertionPeriod;
+        baseStakeAmount = _config.baseStakeAmount;
+
+        // Initialize role based access control
+        for (uint256 i = 0; i < _config.validators.length; i++) {
+            grantRole(VALIDATOR_ROLE, _config.validators[i]);
+        }
+        emit ConfigChanged();
+    }
+
+    /// @inheritdoc IRollup
+    function setVault(address newVault) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newVault == address(0)) {
+            revert ZeroAddress();
+        }
+        vault = newVault;
+        emit ConfigChanged();
+    }
+
+    /// @inheritdoc IRollup
     function setDAProvider(address newDAProvider) external override onlyRole(DEFAULT_ADMIN_ROLE) {
         if (lastCreatedAssertionID > lastResolvedAssertionID) {
             revert InvalidConfigChange();
         }
         daProvider = IDAProvider(newDAProvider);
+        emit ConfigChanged();
+    }
+
+    /// @inheritdoc IRollup
+    function setVerifier(address newVerifier) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newVerifier == address(0)) {
+            revert ZeroAddress();
+        }
+        verifier = IVerifier(newVerifier);
         emit ConfigChanged();
     }
 
